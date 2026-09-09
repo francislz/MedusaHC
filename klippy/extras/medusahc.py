@@ -104,17 +104,37 @@ class MedusaHC:
                 "require_sensors: False to run on software tool state."
                 % self.pin_watch_name
             )
+        if self.printer.is_shutdown():
+            return
         self.feeder_open = bool(int(self._global().get("feeder_open", 0)))
-        # Keep the servo output disabled during MCU/config startup, then move it
-        # directly to the configured closed position as soon as Klipper is
-        # ready.  This avoids a hard-coded initial_angle briefly opening the
-        # feeder before TOOL_CFG is available.
-        close_angle = float(self._tool_cfg().get("servo_close_angle", 180.0))
-        self._run("SET_SERVO SERVO=%s ANGLE=%s" % (self._servo(), close_angle))
+        # DO NOT issue G-code here.
+        #
+        # This used to move the servo to its closed position from inside the
+        # klippy:ready handler. SET_SERVO schedules a timed pulse against
+        # toolhead.get_last_move_time(), and at the instant ready fires the
+        # toolhead's print_time base is not yet reliably ahead of the MCU
+        # clock. The result was a queue_digital_out asking the toolhead MCU to
+        # change a pin ~28 ms in the PAST, which the MCU rejects by shutting
+        # down with "Timer too close" - on a board that was otherwise 1.4%
+        # busy with zero CAN retransmits.
+        #
+        # The feeder is put in its known closed state by _initialize_timer
+        # below, which runs off the reactor two seconds later and is safe.
+        # Set the servo's initial_angle in the [servo] section to the same
+        # closed angle so it never rests mid-travel before then.
         self.reactor.update_timer(self._init_timer, self.reactor.monotonic() + 2.0)
 
     def _initialize_timer(self, eventtime):
         """Populate derived runtime values after all Klipper objects are ready."""
+        # Bail out if something else has already shut the printer down. Every
+        # command below goes through run_script_from_command, and after a
+        # shutdown Klipper swaps in its restricted handler table, so even
+        # SET_GCODE_VARIABLE comes back as the shutdown message. Reporting that
+        # as "MedusaHC initialization failed" buries the real fault.
+        if self.printer.is_shutdown():
+            self.last_error = "Printer shut down before MedusaHC could initialize"
+            logging.warning("MedusaHC: %s", self.last_error)
+            return self.reactor.NEVER
         try:
             cfg = self._tool_cfg()
             for name, multiplier in (
@@ -138,9 +158,15 @@ class MedusaHC:
             self._restore_saved_offsets()
             self._close()
             self.gcode.respond_info("MedusaHC controller initialized")
-        except Exception:
-            logging.exception("MedusaHC initialization failed")
-            self.last_error = "Initialization failed; see klippy.log"
+        except Exception as exc:
+            if self.printer.is_shutdown():
+                # The printer went down mid-initialization. The MCU shutdown
+                # reason is the real error; do not dress it up as ours.
+                self.last_error = "Printer shut down during MedusaHC init"
+                logging.warning("MedusaHC: %s (%s)", self.last_error, exc)
+            else:
+                logging.exception("MedusaHC initialization failed")
+                self.last_error = "Initialization failed; see klippy.log"
         return self.reactor.NEVER
 
     def _restore_saved_offsets(self):
