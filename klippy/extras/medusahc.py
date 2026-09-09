@@ -272,7 +272,21 @@ class MedusaHC:
         self.gcode.run_script_from_command(script)
 
     def _set_compat(self, variable, value):
+        """Mirror a runtime value into GLOBAL_STATE for macros and the UI.
+
+        Klipper's SET_GCODE_VARIABLE refuses to create a variable that the
+        macro did not declare, so a config that trims the unused compatibility
+        variables would otherwise abort initialization on the first one. This
+        is only a mirror - nothing here is load-bearing - so a missing variable
+        is skipped rather than raised.
+        """
         global_macro = self._macro_name("GLOBAL_STATE")
+        if variable not in self._global():
+            logging.debug(
+                "MedusaHC: %s does not declare '%s'; skipping mirror",
+                global_macro, variable,
+            )
+            return
         self._run(
             "SET_GCODE_VARIABLE MACRO=%s VARIABLE=%s VALUE=%s"
             % (global_macro, variable, value)

@@ -91,8 +91,18 @@ class PinWatch:
                 )
             )
 
-        # Initial compute
+        # Initial compute. This runs before Klipper reaches the ready state, so
+        # it establishes current_tool but cannot push the UI sync (see
+        # _run_cmd). The ready handler below repeats it once G-code is safe.
         self._schedule_compute("startup", 0.0)
+        self.printer.register_event_handler("klippy:ready", self._handle_ready)
+
+    def _handle_ready(self):
+        """Recompute once the gcode dispatcher accepts commands."""
+        # Drop the UI caches so the sync is treated as a change and re-sent.
+        self._last_ui_active = None
+        self._last_ui_lamp = {}
+        self._schedule_compute("ready", 0.0)
 
     # --- status export for Jinja ---
     def get_status(self, eventtime):
@@ -254,8 +264,13 @@ class PinWatch:
         return st == "printing"
 
     def _run_cmd(self, line):
-        # your rule: ONLY this way
-        self.gcode.run_script_from_command(line)
+        # The initial compute is scheduled from __init__, so it can fire before
+        # Klipper reaches the ready state. Running G-code then hits the
+        # restricted handler table and raises, which produced a traceback per
+        # tool at every startup. The UI sync is cosmetic, so simply defer it -
+        # the next sensor edge, or the ready-state recompute, refreshes it.
+        if not self.printer.is_shutdown() and self.gcode.is_printer_ready:
+            self.gcode.run_script_from_command(line)
 
     def _request_toolchanger_sync(self, ct):
         # Printing: only initialize for ct>=0, never unselect
