@@ -60,6 +60,7 @@ class MedusaHC:
         self.feeder_open = False
         self.layer = 0
         self.return_pos = None
+        self._brush_warned = False
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self._init_timer = self.reactor.register_timer(self._initialize_timer)
         self._register_commands()
@@ -239,6 +240,22 @@ class MedusaHC:
 
     def _offsets(self):
         return self._macro("TOOL_OFFSET")
+
+    def _tool_state(self, tool):
+        """Per-tool prime/brush settings, or an empty mapping.
+
+        Every value read from here has a default, so a printer with no purge
+        bin and a delegated brush macro never needs these sections at all.
+        A missing one must not abort a tool change, which is what the hard
+        _macro() lookup used to do:
+            "MedusaHC requires [gcode_macro TOOL_STATE_0] or [_TOOL_STATE_0]"
+        """
+        name = "TOOL_STATE_%d" % tool
+        for candidate in ("_" + name, name):
+            obj = self.printer.lookup_object("gcode_macro %s" % candidate, None)
+            if obj is not None:
+                return obj.variables
+        return {}
 
     def _sensor_source(self):
         if self.pin_watch is None:
@@ -536,17 +553,53 @@ RESTORE_GCODE_STATE NAME=MHC_CLOSE MOVE=0""".format(
         physical stepper and TMC driver, so feeder moves are unaffected.
         """
         name = "extruder" if tool == 0 else "extruder%d" % tool
-        if self.printer.lookup_object(name, None) is None:
+        target = self.printer.lookup_object(name, None)
+        if target is None:
+            return
+        # Skip the call when it is already active; Klipper answers that with an
+        # "Extruder %s already active" notice that looks like a fault in the
+        # console during an otherwise clean tool change.
+        toolhead = self.printer.lookup_object("toolhead", None)
+        if toolhead is not None and toolhead.get_extruder() is target:
             return
         self._run("ACTIVATE_EXTRUDER EXTRUDER=%s" % name)
 
-    def _brush_macro(self):
-        """Name of the standalone brush primitive, or None.
+    # Names that would call straight back into this module.
+    _BRUSH_RESERVED = ("CLEAN", "MHC_CLEAN")
 
-        Deliberately the primitive (_BRUSH_WIPE) and never CLEAN: on a config
-        where CLEAN is wired to MHC_CLEAN, calling CLEAN from here would
-        recurse forever.
+    def _brush_macro(self):
+        """Name of the macro that wipes the nozzle, or None.
+
+        TOOL_CFG.brush_macro names it explicitly, so a printer can swap in its
+        own routine without touching this file. With nothing configured, fall
+        back to the conventional primitive names.
+
+        CLEAN is rejected: MHC_macros.cfg wires CLEAN to MHC_CLEAN, so calling
+        it from here would recurse forever.
         """
+        configured = str(self._tool_cfg().get("brush_macro", "")).strip()
+        if configured:
+            if configured.upper() in self._BRUSH_RESERVED:
+                if not self._brush_warned:
+                    self._brush_warned = True
+                    self.gcode.respond_info(
+                        "MedusaHC: TOOL_CFG.brush_macro cannot be '%s' - that "
+                        "command calls the toolchanger, which would recurse. "
+                        "Point it at the macro that moves the toolhead."
+                        % configured
+                    )
+                return None
+            if self.printer.lookup_object(
+                    "gcode_macro %s" % configured, None) is not None:
+                return configured
+            if not self._brush_warned:
+                self._brush_warned = True
+                self.gcode.respond_info(
+                    "MedusaHC: TOOL_CFG.brush_macro is '%s' but no "
+                    "[gcode_macro %s] exists; nozzle cleaning is disabled."
+                    % (configured, configured)
+                )
+            return None
         for name in ("_BRUSH_WIPE", "BRUSH_WIPE"):
             if self.printer.lookup_object("gcode_macro %s" % name, None) is not None:
                 return name
@@ -789,7 +842,7 @@ M106 S255""".format(
         a print, the two dedicated short retracts replace the normal prime and
         cleaning retracts because the slicer has no matching unretract yet.
         """
-        state = self._macro("TOOL_STATE_%d" % tool)
+        state = self._tool_state(tool)
         first_prime_executed = False
         # Priming needs somewhere to put the filament. A machine with no purge
         # bin leaves y_prime unset, and the whole prime block is skipped.
@@ -954,7 +1007,7 @@ G1 Y{safe} F{feed}""".format(
                     "dock-relative brush, or provide a _BRUSH_WIPE macro)"
                 )
             return
-        state = self._macro("TOOL_STATE_%d" % tool)
+        state = self._tool_state(tool)
         old_accel = self._old_accel()
         cmx = float(state.get("x_clean_move", 0.0))
         cmy = float(state.get("y_clean_move", 0.0))
@@ -1032,11 +1085,19 @@ SET_VELOCITY_LIMIT ACCEL={old}""".format(
 
     def cmd_PRIME_FLAGS_SET(self, gcmd):
         for tool in range(self._tool_count()):
-            state_macro = self._macro_name("TOOL_STATE_%d" % tool)
-            self._run(
-                "SET_GCODE_VARIABLE MACRO=%s VARIABLE=first_prime_flag VALUE=1"
-                % state_macro
-            )
+            name = "TOOL_STATE_%d" % tool
+            for candidate in ("_" + name, name):
+                obj = self.printer.lookup_object(
+                    "gcode_macro %s" % candidate, None)
+                if obj is None:
+                    continue
+                # Only write a flag the macro actually declares.
+                if "first_prime_flag" in obj.variables:
+                    self._run(
+                        "SET_GCODE_VARIABLE MACRO=%s "
+                        "VARIABLE=first_prime_flag VALUE=1" % candidate
+                    )
+                break
 
 
 def load_config(config):
