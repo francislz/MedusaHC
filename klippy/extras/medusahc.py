@@ -453,12 +453,18 @@ class MedusaHC:
         # above where we left off. The second term is what stops us ploughing
         # through a print taller than the current height.
         z_travel = max(cz, rz + 3.0)
+        # The brush retreat now ends just above the print instead of back at
+        # dock height, so this travel can be low. Cross in the Y >= y_safe
+        # corridor and only then drop to a return point in front of it, so a
+        # diagonal never cuts over the dock row.
+        y_safe = v["y_safe"]
         self._run("""G90
 G1 Z{ztravel} F{zfeed}
-G1 X{rx} Y{ry} F{feed}
+G1 X{rx} Y{ycorr} F{feed}
+G1 Y{ry} F{feed}
 G1 Z{rz} F{zfeed}""".format(
             ztravel=z_travel, zfeed=v.get("z_feed", v["feed"]),
-            rx=rx, ry=ry, rz=rz, feed=v["feed"]
+            rx=rx, ry=ry, ycorr=max(ry, y_safe), rz=rz, feed=v["feed"]
         ))
 
     def _clear_offsets(self):
@@ -617,7 +623,13 @@ RESTORE_GCODE_STATE NAME=MHC_CLOSE MOVE=0""".format(
                 % (tool, temp, min_temp)
             )
             return True
-        self._run(macro)
+        if self.return_pos is not None:
+            # Mid-change: tell the brush it only has to lift clear of the
+            # print, not climb back to dock height. _do_return then crosses
+            # at that same height (rz + 3) and goes straight down to rz.
+            self._run("%s RETREAT_Z=%.3f" % (macro, self.return_pos[2] + 3.0))
+        else:
+            self._run(macro)
         return True
 
     def _apply_offset(self, tool, move=1):
