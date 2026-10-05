@@ -611,7 +611,40 @@ RESTORE_GCODE_STATE NAME=MHC_CLOSE MOVE=0""".format(
                 return name
         return None
 
-    def _brush(self, tool, min_temp=140.0):
+    def _shared_prime_params(self, tool, state):
+        """Prime amounts for a brush macro that owns a shared purge bucket.
+
+        Same amounts and first-use rules as the dock-relative prime in
+        _after_pick, handed to the brush macro as parameters instead of being
+        extruded here, because the bucket sits next to the shared brush rather
+        than at a per-dock position. Empty outside a print or below 190C.
+        """
+        if not self._is_printing() or self._heater_temperature(tool) <= 190.0:
+            return {}
+        params = {}
+        first = False
+        if (int(state.get("first_prime_enabled", 1)) != 0
+                and int(state.get("first_prime_flag", 1)) == 0):
+            params["FIRST_PRIME"] = float(state.get("first_prime_amount", 0.0))
+            params["FIRST_PRIME_SPEED"] = float(state.get("first_prime_speed", 1.0))
+            self._run(
+                "SET_GCODE_VARIABLE MACRO=%s VARIABLE=first_prime_flag VALUE=1"
+                % self._macro_name("TOOL_STATE_%d" % tool)
+            )
+            first = True
+        params["PRIME"] = float(state.get("prime_amount", 0.0))
+        params["PRIME_SPEED"] = float(state.get("prime_speed", 1.0))
+        params["PRIME_RETRACT"] = float(state.get(
+            "first_prime_prime_retract", 0.2
+        )) if first else float(state.get("prime_retract", 0.0))
+        params["PRIME_RETRACT_SPEED"] = float(state.get("prime_retract_speed", 1.0))
+        params["CLEAN_RETRACT"] = float(state.get(
+            "first_prime_clean_retract", 0.1
+        )) if first else float(state.get("clean_retract", 0.0))
+        params["CLEAN_RETRACT_SPEED"] = float(state.get("clean_retract_speed", 1.0))
+        return params
+
+    def _brush(self, tool, min_temp=140.0, extra=None):
         """Wipe on the shared brush, skipping a nozzle too cold to clean."""
         macro = self._brush_macro()
         if macro is None:
@@ -623,13 +656,15 @@ RESTORE_GCODE_STATE NAME=MHC_CLOSE MOVE=0""".format(
                 % (tool, temp, min_temp)
             )
             return True
+        params = dict(extra or {})
         if self.return_pos is not None:
             # Mid-change: tell the brush it only has to lift clear of the
             # print, not climb back to dock height. _do_return then crosses
             # at that same height (rz + 3) and goes straight down to rz.
-            self._run("%s RETREAT_Z=%.3f" % (macro, self.return_pos[2] + 3.0))
-        else:
-            self._run(macro)
+            params["RETREAT_Z"] = self.return_pos[2] + 3.0
+        self._run(" ".join([macro] + [
+            "%s=%.3f" % (key, value) for key, value in sorted(params.items())
+        ]))
         return True
 
     def _apply_offset(self, tool, move=1):
@@ -898,7 +933,8 @@ G90""".format(
             # or there is no brush at all.
             cleaned = False
             if int(cfg.get("clean_on_pickup", 0)) != 0:
-                cleaned = self._brush(tool)
+                cleaned = self._brush(
+                    tool, extra=self._shared_prime_params(tool, state))
             if not cleaned:
                 self._run("G90\nG1 Y%s F%s" % (v["y_safe"], v["feed"]))
             self._apply_offset(tool)
