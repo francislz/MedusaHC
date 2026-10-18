@@ -452,18 +452,23 @@ class MedusaHC:
         # Cross the bed at whichever is higher: where we already are, or 3 mm
         # above where we left off. The second term is what stops us ploughing
         # through a print taller than the current height.
-        z_travel = max(cz, rz + 3.0)
-        # The brush retreat now ends just above the print instead of back at
-        # dock height, so this travel can be low. Cross in the Y >= y_safe
-        # corridor and only then drop to a return point in front of it, so a
-        # diagonal never cuts over the dock row.
+        z_travel = rz + 3.0
+        # Cross in the Y >= y_safe corridor and only then drop to a return
+        # point in front of it, so a diagonal never cuts over the dock row.
         y_safe = v["y_safe"]
-        self._run("""G90
-G1 Z{ztravel} F{zfeed}
-G1 X{rx} Y{ycorr} F{feed}
+        zfeed = v.get("z_feed", v["feed"])
+        if cz > z_travel:
+            # Coming down from above (dock height, a dock-mounted brush):
+            # descend WHILE crossing instead of crossing high and then
+            # dropping. Every point of the move is at or above rz + 3, so it
+            # still clears the print, and Y stays >= y_safe.
+            cross = "G1 X{rx} Y{ycorr} Z{ztravel} F{feed}"
+        else:
+            cross = "G1 Z{ztravel} F{zfeed}\nG1 X{rx} Y{ycorr} F{feed}"
+        self._run(("G90\n" + cross + """
 G1 Y{ry} F{feed}
-G1 Z{rz} F{zfeed}""".format(
-            ztravel=z_travel, zfeed=v.get("z_feed", v["feed"]),
+G1 Z{rz} F{zfeed}""").format(
+            ztravel=z_travel, zfeed=zfeed,
             rx=rx, ry=ry, ycorr=max(ry, y_safe), rz=rz, feed=v["feed"]
         ))
 
@@ -657,6 +662,17 @@ RESTORE_GCODE_STATE NAME=MHC_CLOSE MOVE=0""".format(
             )
             return True
         params = dict(extra or {})
+        state = self._tool_state(tool)
+        if (int(state.get("dock_brush", 0)) != 0
+                and self.printer.lookup_object(
+                    "gcode_macro _DOCK_BRUSH_WIPE", None) is not None):
+            # This tool has its own PTFE roller + brush on its dock. The macro
+            # leaves at brush height in the Y corridor; _do_return descends
+            # towards the print while it travels.
+            self._run(" ".join(["_DOCK_BRUSH_WIPE T=%d" % tool] + [
+                "%s=%.3f" % (key, value) for key, value in sorted(params.items())
+            ]))
+            return True
         if self.return_pos is not None:
             # Mid-change: tell the brush it only has to lift clear of the
             # print, not climb back to dock height. _do_return then crosses
