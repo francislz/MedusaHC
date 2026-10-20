@@ -59,6 +59,13 @@ class MedusaHC:
         self.last_error = ""
         self.feeder_open = False
         self.layer = 0
+        # Tool changes made during the current print, for "done / total" in the
+        # UIs (the total is the slicer's "total filament change" metadata).
+        self.toolchange_count = 0
+        self._toolchange_job = None
+        # Filament the dock brush retracted after priming, pushed back once the
+        # toolhead is over the print again: (length, speed in mm/min).
+        self._pending_deretract = None
         self.return_pos = None
         self._brush_warned = False
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
@@ -77,6 +84,9 @@ class MedusaHC:
             "MHC_TOOL_OFFSET": (self.cmd_MHC_TOOL_OFFSET, "Apply a tool offset"),
             "MHC_ASSIGN_TOOL": (self.cmd_MHC_ASSIGN_TOOL, "Sync klipper-toolchanger"),
             "MHC_LAYER_SET": (self.cmd_MHC_LAYER_SET, "Update the current layer"),
+            "MHC_RESET_TOOLCHANGES": (
+                self.cmd_MHC_RESET_TOOLCHANGES, "Zero the tool change counter of this print"
+            ),
         }
         if self.legacy_commands:
             # Invisible compatibility commands for existing slicer and common
@@ -203,6 +213,7 @@ class MedusaHC:
             "last_error": self.last_error,
             "feeder_open": self.feeder_open,
             "layer": self.layer,
+            "toolchanges": self.toolchange_count,
             "sensor_error": self._current_tool() == -2,
             "tool_count": self._tool_count(),
             "sensors": sensors,
@@ -358,6 +369,28 @@ class MedusaHC:
             raise _OperationPaused(message)
         raise self.printer.command_error(message)
 
+    def _print_job(self):
+        """(filename, total_duration) of the current print, to tell prints apart."""
+        stats = self.printer.lookup_object("print_stats", None)
+        if stats is None:
+            return None
+        status = stats.get_status(self.reactor.monotonic())
+        return status.get("filename", ""), float(status.get("total_duration", 0.0))
+
+    def _reset_toolchanges(self):
+        self.toolchange_count = 0
+        self._toolchange_job = self._print_job()
+
+    def _count_toolchange(self):
+        # A new file, or a print clock that went backwards, is a new print:
+        # start from zero even if PRINT_START did not reset the counter.
+        job = self._print_job()
+        last = self._toolchange_job
+        if last is None or job is None or job[0] != last[0] or job[1] < last[1]:
+            self.toolchange_count = 0
+        self.toolchange_count += 1
+        self._toolchange_job = job
+
     def _is_printing(self):
         stats = self.printer.lookup_object("print_stats", None)
         return getattr(stats, "state", "") == "printing"
@@ -444,6 +477,7 @@ class MedusaHC:
     def _do_return(self, v):
         """Travel back to the pre-change position, Z last."""
         if self.return_pos is None:
+            self._pending_deretract = None
             return
         rx, ry, rz = self.return_pos
         self.return_pos = None
@@ -471,6 +505,24 @@ G1 Z{rz} F{zfeed}""").format(
             ztravel=z_travel, zfeed=zfeed,
             rx=rx, ry=ry, ycorr=max(ry, y_safe), rz=rz, feed=v["feed"]
         ))
+        self._deretract()
+
+    def _deretract(self):
+        """Push back what the dock brush retracted, now that we are at the print.
+
+        The retract keeps the primed nozzle from oozing on the way back, but
+        OrcaSlicer does not unretract after a tool change when the prime tower
+        is on, so without this the first millimetres on the tower come out
+        empty.
+        """
+        pending, self._pending_deretract = self._pending_deretract, None
+        if not pending or pending[0] <= 0.0:
+            return
+        length, speed = pending
+        self._run("""SAVE_GCODE_STATE NAME=MHC_DERETRACT
+M83
+G1 E{length:.3f} F{speed:.0f}
+RESTORE_GCODE_STATE NAME=MHC_DERETRACT MOVE=0""".format(length=length, speed=speed))
 
     def _clear_offsets(self):
         """Zero every axis of the gcode offset before dock motion.
@@ -672,6 +724,14 @@ RESTORE_GCODE_STATE NAME=MHC_CLOSE MOVE=0""".format(
             self._run(" ".join(["_DOCK_BRUSH_WIPE T=%d" % tool] + [
                 "%s=%.3f" % (key, value) for key, value in sorted(params.items())
             ]))
+            # Mirror what the macro retracted: the prime retract only when it
+            # primed, the clean retract whenever it was asked for.
+            primed = params.get("PRIME", 0.0) > 0 or params.get("FIRST_PRIME", 0.0) > 0
+            length = params.get("CLEAN_RETRACT", 0.0)
+            if primed:
+                length += params.get("PRIME_RETRACT", 0.0)
+            speed = params.get("PRIME_RETRACT_SPEED", 30.0) * 60.0
+            self._pending_deretract = (length, speed) if length > 0 else None
             return True
         if self.return_pos is not None:
             # Mid-change: tell the brush it only has to lift clear of the
@@ -1033,11 +1093,19 @@ G1 Y{safe} F{feed}""".format(
             # Vertical-latch machines end the change at dock height, far from
             # the print. _do_return is a no-op when nothing was saved.
             self._do_return(self._motion_values(tool))
+            # Only a swap counts, matching the slicer's "total filament change",
+            # which leaves out loading the first tool.
+            if current >= 0 and self._is_printing():
+                self._count_toolchange()
         except _OperationPaused as exc:
             self.gcode.respond_info("MedusaHC paused: %s" % exc)
         finally:
             if self.operation != "idle":
                 self._finish()
+
+    def cmd_MHC_RESET_TOOLCHANGES(self, gcmd):
+        self._reset_toolchanges()
+        gcmd.respond_info("MedusaHC: tool change counter reset")
 
     def cmd_MHC_DROP(self, gcmd):
         """Park the attached hotend, if any."""
